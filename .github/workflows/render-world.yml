@@ -137,7 +137,7 @@ env:
   # a change to design/packages/render-actions or design/packages/site lands on this
   # project's own main branch, update this value to that commit in the same change - a
   # toolchain that silently changed between runs is a render nobody could reproduce.
-  WORLDLENS_TOOLCHAIN_COMMIT: 9f52322cdfe284553499486bb1a8ffd2916331e3
+  WORLDLENS_TOOLCHAIN_COMMIT: 40680d795ae388e5a4de05fa299e95ee2af39ab8
 
 jobs:
   # ---------------------------------------------------------------------------------
@@ -162,7 +162,7 @@ jobs:
       # carries the submodule, read the commit it moved to, and update this value in
       # the same commit as a person reviewing the change - a render that silently
       # changed renderer version between runs is a render nobody could reproduce.
-      BLUEMAP_UPSTREAM_COMMIT: 4c4cbc291b361ceff6ee239448e9f988f9019dbb
+      BLUEMAP_UPSTREAM_COMMIT: 0b8544162cf6d7e049826cbe7d80989b5f2b8846
     steps:
       # Restore rather than the full cache action, so the build below only runs on a
       # genuine miss and the save step still runs after a build that failed partway
@@ -185,7 +185,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git clone --quiet https://github.com/BlueMap-Minecraft/BlueMap.git vendor/BlueMap
+          git clone --quiet https://github.com/Ding-Ding-Projects/BlueMap.git vendor/BlueMap
           git -C vendor/BlueMap checkout --quiet "$BLUEMAP_UPSTREAM_COMMIT"
           # Upstream vendors BlueMapAPI as its own submodule and takes the api version from it, so
           # a clone without this leaves that directory empty and the build fails while configuring
@@ -291,6 +291,30 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+
+      # A Pages deployment fails with a bare 404 when the repository has no Pages site,
+      # and by then the whole render has already been paid for. Measured: a real run planned,
+      # rendered both shards and merged them over about forty minutes, then lost all of it at
+      # "Publish to Pages" because of a repository setting one API call can read. Check it
+      # here, in the two-minute job, rather than at the end of the expensive one.
+      - name: Check that Pages can receive this map
+        if: inputs.output == 'artifact-and-pages'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.ORG_TOKEN || secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh api "repos/${GITHUB_REPOSITORY}/pages" >/dev/null 2>&1; then
+            echo "Pages is enabled on ${GITHUB_REPOSITORY}, so the finished map has somewhere to land."
+            exit 0
+          fi
+          echo "No Pages site on ${GITHUB_REPOSITORY} yet. Trying to enable a workflow-backed one."
+          if gh api -X POST "repos/${GITHUB_REPOSITORY}/pages" -f build_type=workflow >/dev/null 2>&1; then
+            echo "Enabled workflow-backed Pages on ${GITHUB_REPOSITORY}."
+            exit 0
+          fi
+          echo "::error::This run asked for output 'artifact-and-pages' and ${GITHUB_REPOSITORY} has no GitHub Pages site. Enabling one automatically was refused, which usually means this token has no administration rights on the repository. Turn Pages on at https://github.com/${GITHUB_REPOSITORY}/settings/pages with GitHub Actions as the source, or re-dispatch with output 'artifact' to keep the map as a downloadable artifact. Stopping now, because rendering the whole world first and losing it at the last step helps nobody."
+          exit 1
 
       # This project's own tooling, fresh at a pinned commit, rather than assumed to sit
       # beside `.github/workflows` in whichever repository dispatched this workflow. A
@@ -1134,8 +1158,24 @@ jobs:
             --web-root site \
             --summary "$GITHUB_STEP_SUMMARY"
 
-      - name: Combine the site and the map
+      # Pages takes the preview, not the whole map.
+      #
+      # GitHub refuses a Pages artifact over 1 GB, and a rendered world is routinely far
+      # more than that - one real run uploaded 13,663,125,137 bytes and the deployment
+      # failed after every render job had succeeded, which is the worst possible place to
+      # discover a hard limit. So the hires tiles (`tiles/0`, the overwhelming bulk of a
+      # map) stay in the release download, and Pages gets the webapp plus the lowres
+      # pyramid: the map opens, pans and zooms out, and zooming all the way in is the one
+      # thing it cannot do. The size is measured before the upload and the run fails here,
+      # with the real number, rather than uploading and hoping.
+      - name: Combine the site and the map preview
         if: inputs.output == 'artifact-and-pages' && needs.plan.outputs.single-group == 'true'
+        # Bound here rather than interpolated into the script below. A world path is a name
+        # somebody else chose, and expanded into shell text it is somebody else's shell.
+        env:
+          MAP_ID: ${{ needs.plan.outputs.map-id }}
+          WORLD_PATH: ${{ inputs.world }}
+          TOOLCHAIN_COMMIT: ${{ env.WORLDLENS_TOOLCHAIN_COMMIT }}
         run: |
           set -euo pipefail
           rm -rf pages-root
@@ -1146,8 +1186,45 @@ jobs:
           fi
           mkdir -p pages-root/map
           cp -r site/. pages-root/map/
+
+          hires_bytes=0
+          for hires in pages-root/map/maps/*/tiles/0; do
+            [ -d "$hires" ] || continue
+            hires_bytes=$((hires_bytes + $(du -sb "$hires" | cut -f1)))
+            rm -rf "$hires"
+          done
+
+          # The page that says what this render was, at /render/ - beside the map rather
+          # than inside it. The map is upstream's webapp, and a page of ours in there is a
+          # file upstream's next release quietly overwrites. It is never fatal: a missing
+          # page is a missing page, and failing a finished render over one would be trading
+          # the whole world for a footnote.
+          backups_arg=""
+          if [ -f toolchain/worlds/index.json ]; then
+            backups_arg="--backups toolchain/worlds/index.json"
+          fi
+          node toolchain/design/packages/render-actions/dist/cli.js render-page             --out pages-root/render             --owner "${GITHUB_REPOSITORY%%/*}"             --repo "${GITHUB_REPOSITORY#*/}"             --map-id "${MAP_ID}"             --map-name "${MAP_ID}"             --world "${WORLD_PATH}"             --commit "${TOOLCHAIN_COMMIT}"             --run-id "${GITHUB_RUN_ID}"             ${backups_arg}             || echo "::warning::the render page could not be written; the map is unaffected"
+
+          preview_bytes=$(du -sb pages-root | cut -f1)
+          limit_bytes=$((900 * 1000 * 1000))
           echo "documentation site: $(find pages-root -maxdepth 1 -type f | wc -l) root files"
-          echo "rendered map:       $(find pages-root/map -type f | wc -l) files under /map/"
+          echo "map preview:        $(find pages-root/map -type f | wc -l) files under /map/"
+          echo "hires tiles held back for the download: ${hires_bytes} bytes"
+          echo "preview size: ${preview_bytes} bytes (limit ${limit_bytes})"
+
+          {
+            echo "## Published to Pages"
+            echo ""
+            echo "Pages carries the **map preview**: the web app and the lowres tile pyramid,"
+            echo "${preview_bytes} bytes. The full-resolution tiles are ${hires_bytes} bytes and"
+            echo "travel with the **rendered-map** download instead, because GitHub refuses a"
+            echo "Pages artifact over 1 GB."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$preview_bytes" -gt "$limit_bytes" ]; then
+            echo "::error::the map preview is ${preview_bytes} bytes, past the ${limit_bytes} this publishes; GitHub Pages refuses anything over 1 GB. Nothing was uploaded."
+            exit 1
+          fi
 
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         if: inputs.output == 'artifact-and-pages' && needs.plan.outputs.single-group == 'true'
